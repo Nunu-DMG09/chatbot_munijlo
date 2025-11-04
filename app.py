@@ -9,10 +9,10 @@ from typing import List
 # === CONFIGURACIÓN ===
 DATA_FILE = "empresa.json"
 OLLAMA_MODEL = "tinyllama:latest"
-OLLAMA_MAX_TOKENS = 180
-OLLAMA_TIMEOUT = 60
-OLLAMA_RETRIES = 0  # reintentos opcional
-MAX_DOCS = 3        # documentos usados para generar la respuesta
+OLLAMA_MAX_TOKENS = 120     # reducir para respuestas más rápidas
+OLLAMA_TIMEOUT = 20        # timeout menor para mayor responsividad
+OLLAMA_RETRIES = 0         # reintentos opcional
+MAX_DOCS = 3               # documentos usados para generar la respuesta
 
 # === CARGAR DATOS ===
 with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -63,6 +63,11 @@ def _is_related_query(query: str) -> bool:
     q = (query or "").lower()
     keywords = ["servici", "licencia", "certificado", "tramite", "autoriz", "construcción", "evento", "anuncio", "constancia", "numeración", "defensa civil", "arbitrios", "posesión"]
     return any(k in q for k in keywords)
+
+def _is_greeting(query: str) -> bool:
+    if not query:
+        return False
+    return bool(re.search(r'^\s*(hola|hey|buenas|buenos días|buenas tardes|buenas noches)\b', query, re.I))
 
 def _build_paraphrase_from_item(item: dict, query: str) -> str:
     nombre = _normalize(item.get("nombre") or item.get("titulo"))
@@ -223,82 +228,130 @@ def _call_ollama(prompt: str) -> str:
 
 def _process_query_with_model(query: str):
     """
-    Usar el modelo para parafrasear SOLO la información extraída de empresa.json.
-    Construye el contexto a partir de los documentos devueltos por chroma (no indexa manualmente el array).
+    Prioriza coincidencia exacta/contiene con el campo 'nombre' antes
+    de usar la búsqueda por similaridad. Responde en español, breve,
+    y siempre basado en empresa.json.
     """
+    q = (query or "").strip()
+    if not q:
+        return "No puedo hablar sobre eso."
+
+    # normalizador simple (quita tildes y normaliza a ascii lowercase)
+    import unicodedata
+    def _norm_txt(s: str) -> str:
+        if not s:
+            return ""
+        s2 = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+        return re.sub(r'\s+', ' ', s2).strip().lower()
+
+    nq = _norm_txt(q)
+
+    # 1) Buscar coincidencia exacta / contiene en 'nombre' en todo el JSON
+    exact_candidates = []
+    best_len = 0
+    for idx, item in enumerate(data):
+        nombre = item.get("nombre") or item.get("titulo") or ""
+        nn = _norm_txt(nombre)
+        if not nn:
+            continue
+        # condiciones de coincidencia: igualdad, nombre dentro de la consulta, o consulta dentro del nombre
+        if nn == nq or f" {nn} " in f" {nq} " or nq in nn or nn in nq:
+            ln = len(nn)
+            if ln > best_len:
+                exact_candidates = [(idx, item)]
+                best_len = ln
+            elif ln == best_len:
+                exact_candidates.append((idx, item))
+
+    if exact_candidates:
+        # usar el candidato con nombre más largo (mejor especificidad)
+        chosen = exact_candidates[0][1]
+        resp = _build_paraphrase_from_item(chosen, query)
+        # asegurar formato breve y en español
+        resp = resp.strip()
+        if not resp.endswith("."):
+            resp += "."
+        return resp
+
+    # 2) Si no hay coincidencia exacta, usar búsqueda por Chroma y modelo (flujo anterior)
     res = _query_collection(query, n_results=MAX_DOCS)
     docs = res.get("documents", [[]])[0] if res else []
+    ids = res.get("ids", [[]])[0] if res else []
     if not docs:
         return "No puedo hablar sobre eso."
 
-    # Contexto textual (ya contiene título: descripción)
-    context_text = "\n".join(docs[:MAX_DOCS]).strip()
-    if not context_text:
-        return "No puedo hablar sobre eso."
+    # construir contexto a partir de documentos devueltos por chroma
+    context_items = []
+    for id_str in ids[:MAX_DOCS]:
+        try:
+            context_items.append(data[int(id_str)])
+        except Exception:
+            continue
+    context = _format_context_for_model(context_items) or "\n".join(docs[:MAX_DOCS])
 
-    # Prompt: instruir al modelo a actuar como IA conversacional, usar SOLO el contexto y parafrasear
     prompt = (
-        "Eres un asistente de IA conversacional. RESPONDE en primera persona y de forma natural, "
-        "usando SOLO la información que aparece en la sección \"Información disponible\" más abajo. "
-        "No inventes, no añadas detalles que no estén en esa información. Si la respuesta no puede "
-        "extraerse de la información, responde exactamente: \"No puedo hablar sobre eso.\"\n\n"
-        "Información disponible (usa solo esto para responder):\n"
-        f"{context_text}\n\n"
+        "Eres un asistente de IA conversacional que RESPONDE en primera persona y en español. "
+        "Usa SOLO la información en la sección 'Información disponible' para responder. "
+        "Responde de forma breve y natural (máx 1-2 oraciones). "
+        "Si la pregunta pide un dato concreto (requisitos, duración, costo, oficina, fundamento legal, observaciones), "
+        "responde exactamente con ese dato y no inventes nada.\n\n"
+        "Información disponible:\n"
+        f"{context}\n\n"
         "Pregunta: " + query + "\n\n"
-        "Respuesta (en español, 1-3 oraciones, tono cordial y claro):"
+        "Respuesta:"
     )
 
-    # Llamar al modelo local
     model_out = _call_ollama(prompt)
     if model_out:
-        # si el modelo decide no puede responder, normalizar la negativa exacta
-        if "no puedo hablar" in model_out.lower() or "no puedo responder" in model_out.lower():
+        text = model_out.strip()
+        if re.search(r'no puedo (hablar|responder)', text, re.I):
             return "No puedo hablar sobre eso."
-        # devolver la salida tal cual (ya debería ser parafraseada por el modelo)
-        return model_out.strip()
+        first = re.split(r'[.!?]\s+', text.strip())[0].strip()
+        if first:
+            if not first.endswith("."):
+                first += "."
+            if len(first) < 120:
+                return f"{first} ¿Quieres que te dé más detalles?"
+            return first
 
-    # Fallback local: parafraseo sencillo a partir de las líneas de contexto (si el modelo no responde)
+    # fallback local si el modelo no responde
     paraphrases = []
     for d in docs[:MAX_DOCS]:
-        # d suele ser "Título: descripción" según 'textos' añadido a Chroma
         parts = d.split(":", 1)
         if len(parts) == 2:
             title = parts[0].strip()
             desc = parts[1].strip()
-            # construir frase humana breve
-            frase = f"{title}: {desc.split('.',1)[0].strip()}."
+            paraphrases.append(f"{title}: {desc.split('.',1)[0].strip()}")
         else:
-            frase = d.strip()
-            if not frase.endswith("."):
-                frase += "."
-        paraphrases.append(frase)
-
+            paraphrases.append(d.strip())
     if not paraphrases:
         return "No puedo hablar sobre eso."
-
-    # unir en tono de IA
-    salida = paraphrases[0]
-    if len(paraphrases) > 1:
-        salida = f"{salida} Además, { ' '.join(p for p in paraphrases[1:]) }"
-    # normalizar espacio/puntuación
-    salida = re.sub(r'\s+', ' ', salida).strip()
-    if not salida.endswith("."):
-        salida += "."
-    return salida
+    main = paraphrases[0]
+    respuesta = f"Puedo ayudarte con eso: {main}."
+    respuesta = respuesta[:300].strip()
+    if not respuesta.endswith("."):
+        respuesta += "."
+    return respuesta
 
 @app.post("/ask")
 def ask_post(body: dict = Body(...)):
     query = (body.get("query") or "").strip()
     if not query:
         return {"respuesta": "Falta 'query' en el body."}
-    # si la consulta aparentemente no está relacionada, responder genérico
+
+    # saludo rápido
+    if _is_greeting(query):
+        return {"respuesta": "Hola, soy un asistente virtual. ¿En qué puedo ayudarte?"}
+
+    # si la consulta claramente no está relacionada, responder genérico
     if not _is_related_query(query):
         return {"respuesta": "No puedo hablar sobre eso."}
+
     try:
         texto = _process_query_with_model(query)
+        # asegurar respuesta corta en español
         return {"respuesta": texto}
-    except Exception as e:
-        # imprimir traza en consola y responder negativa segura
+    except Exception:
         import traceback
         print(traceback.format_exc())
         return {"respuesta": "No puedo hablar sobre eso."}
