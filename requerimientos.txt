@@ -1,0 +1,561 @@
+pip install fastapi uvicorn chromadb requests
+
+llama3.2:1b
+
+uvicorn app:app --reload
+curl "http://127.0.0.1:8000/ask?query=¿Qué servicios ofrecen?"
+
+
+from fastapi import FastAPI, Query, Body
+import requests
+import json
+import re
+import chromadb
+from chromadb.utils import embedding_functions
+
+# === CONFIGURACIÓN ===
+OLLAMA_MODEL = "tinyllama:latest"
+OLLAMA_MAX_TOKENS = 256
+OLLAMA_TIMEOUT = 120
+OLLAMA_RETRIES = 1
+DATA_FILE = "empresa.json"
+
+# === CARGAR DATOS ===
+with open(DATA_FILE, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+textos = [f"{item['titulo']}: {item['descripcion']}" for item in data]
+
+# === CONFIGURAR CHROMADB (almacenamiento vectorial local) ===
+client = chromadb.Client()
+
+try:
+    collection = client.get_collection("empresa")
+except Exception:
+    collection = None
+
+ef = None
+try:
+    ef_candidate = embedding_functions.OllamaEmbeddingFunction(model_name="nomic-embed-text")
+    try:
+        _ = ef_candidate(["prueba de embeddings"])
+        ef = ef_candidate
+    except Exception:
+        ef = None
+except Exception:
+    ef = None
+
+if ef is None:
+    try:
+        ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+    except Exception:
+        ef = None
+
+if collection is None:
+    if ef is not None:
+        collection = client.create_collection("empresa", embedding_function=ef)
+    else:
+        collection = client.create_collection("empresa")
+
+if collection.count() == 0:
+    ids = [str(i) for i in range(len(textos))]
+    collection.add(documents=textos, ids=ids)
+
+app = FastAPI(title="API de Empresa con Ollama + RAG")
+
+@app.get("/")
+def root():
+    return {"mensaje": "API de empresa lista. Usa /ask (GET o POST)"}
+
+def extract_text_from_ollama_response(data):
+    if isinstance(data, str):
+        return data
+    if isinstance(data, dict):
+        for k in ("response", "text", "generated", "output", "answer"):
+            if k in data and isinstance(data[k], str):
+                return data[k]
+        if "choices" in data and isinstance(data["choices"], list) and data["choices"]:
+            choice = data["choices"][0]
+            if isinstance(choice, dict):
+                if "content" in choice:
+                    c = choice["content"]
+                    if isinstance(c, str):
+                        return c
+                    if isinstance(c, list):
+                        parts = []
+                        for p in c:
+                            if isinstance(p, dict):
+                                parts.append(p.get("text") or p.get("content") or "")
+                            elif isinstance(p, str):
+                                parts.append(p)
+                        joined = "\n".join([p for p in parts if p])
+                        if joined:
+                            return joined
+                for k2 in ("text", "message", "response"):
+                    if k2 in choice and isinstance(choice[k2], str):
+                        return choice[k2]
+        for k in ("answers",):
+            if k in data and isinstance(data[k], list) and data[k]:
+                v = data[k][0]
+                if isinstance(v, str):
+                    return v
+    return None
+
+def _extract_sentences_with_keyword(text: str, keyword_pattern=r"\bservici"):
+    if not text:
+        return ""
+    # split en oraciones sin usar look-behind de longitud variable
+    try:
+        sentences = re.split(r'(?<=[.!?])\s+|\n+', text)
+    except re.error:
+        # fallback simple si la engine de regex da problemas
+        sentences = re.split(r'\n+', text)
+    matches = []
+    for s in sentences:
+        if s and re.search(keyword_pattern, s, re.I):
+            matches.append(s.strip())
+    return " ".join(matches).strip()
+
+def _process_query(query: str):
+    # Buscar información relevante en la colección
+    try:
+        results = collection.query(query_texts=[query], n_results=5)
+    except Exception as e:
+        return {"respuesta": f"Error en la búsqueda: {e}"}
+
+    docs = results.get("documents", [[]])
+    contexto = "\n".join(docs[0]) if docs and docs[0] else ""
+
+    # Si el contexto contiene la palabra "servicio(s)" devolvemos la sección directamente (no model)
+    servicios_text = _extract_sentences_with_keyword(contexto)
+    if servicios_text:
+        # respuesta concisa y basada en el dato
+        return {"respuesta": servicios_text}
+
+    if not contexto.strip():
+        return {"respuesta": "No tengo información sobre eso."}
+
+    prompt = f"""
+Eres un asistente que RESPONDE SOLO con la información proporcionada en la sección "Información disponible" más abajo.
+No inventes nada. Si la respuesta no está en la información, responde exactamente: "No tengo información sobre eso."
+
+Información disponible:
+{contexto}
+
+Pregunta (responde en español y de forma concisa, 2-4 oraciones como máximo):
+{query}
+"""
+
+    # Llamada a Ollama con reintentos
+    last_exc = None
+    for attempt in range(OLLAMA_RETRIES + 1):
+        try:
+            r = requests.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "max_tokens": OLLAMA_MAX_TOKENS,
+                    "temperature": 0.0
+                },
+                timeout=OLLAMA_TIMEOUT
+            )
+            break
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt < OLLAMA_RETRIES:
+                import time; time.sleep(1)
+    else:
+        return {"respuesta": f"Error conectando a Ollama: {last_exc}"}
+
+    if r.status_code != 200:
+        return {"respuesta": f"Error en la llamada a Ollama: {r.status_code} - {r.text}"}
+
+    # Procesar posible streaming concatenado
+    try:
+        data = r.json()
+        texto = extract_text_from_ollama_response(data)
+        if texto:
+            return {"respuesta": texto.strip()}
+    except Exception:
+        pass
+
+    # fallback: parsear r.text por líneas JSON y concatenar 'response' si existe
+    parts = []
+    for line in (r.text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            # intentar encontrar json dentro de la línea
+            idx = line.find('{')
+            if idx == -1:
+                continue
+            try:
+                obj = json.loads(line[idx:])
+            except Exception:
+                continue
+        if isinstance(obj, dict):
+            if "response" in obj and isinstance(obj["response"], str):
+                parts.append(obj["response"])
+            elif "text" in obj and isinstance(obj["text"], str):
+                parts.append(obj["text"])
+            elif "generated" in obj and isinstance(obj["generated"], str):
+                parts.append(obj["generated"])
+            elif "choices" in obj and isinstance(obj["choices"], list):
+                for ch in obj["choices"]:
+                    if isinstance(ch, dict):
+                        if "content" in ch:
+                            c = ch["content"]
+                            if isinstance(c, str):
+                                parts.append(c)
+                            elif isinstance(c, list):
+                                for b in c:
+                                    if isinstance(b, dict):
+                                        parts.append(b.get("text","") or b.get("content",""))
+                                    elif isinstance(b, str):
+                                        parts.append(b)
+                        elif "text" in ch and isinstance(ch["text"], str):
+                            parts.append(ch["text"])
+    full_text = "".join(parts).strip()
+    if full_text:
+        return {"respuesta": full_text}
+
+    return {"respuesta": "No se pudo generar una respuesta válida del modelo."}
+
+@app.get("/ask")
+def ask_get(query: str = Query(..., description="Pregunta sobre la empresa")):
+    return _process_query(query)
+
+@app.post("/ask")
+def ask_post(body: dict = Body(...)):
+    query = body.get("query")
+    if not query:
+        return {"respuesta": "Falta 'query' en el body."}
+    try:
+        return _process_query(query)
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        # imprime el traceback en la consola (uvicorn) para depuración
+        print(tb)
+        # responde al cliente con mensaje corto (no expongas todo el stack si no quieres)
+        return {"respuesta": "Error interno en el servidor. Revisa la consola de uvicorn.", "error": str(e)}
+
+@app.get("/debug-ollama")
+def debug_ollama():
+    payload = {"model": OLLAMA_MODEL, "prompt": "prueba rápida", "max_tokens": 16}
+    try:
+        r = requests.post("http://localhost:11434/api/generate", json=payload, timeout=30)
+    except Exception as e:
+        return {"error": f"Error conectando a Ollama: {e}"}
+    try:
+        j = r.json()
+    except:
+        j = None
+    return {"status_code": r.status_code, "text_len": len(r.text or ""), "text_preview": (r.text or "")[:1000], "json": j}
+
+
+
+
+
+
+    from fastapi import FastAPI, Query, Body
+import requests
+import json
+import re
+import chromadb
+from chromadb.utils import embedding_functions
+from typing import List
+
+# === CONFIGURACIÓN ===
+DATA_FILE = "empresa.json"
+OLLAMA_MODEL = "tinyllama:latest"
+OLLAMA_MAX_TOKENS = 180
+OLLAMA_TIMEOUT = 60
+OLLAMA_RETRIES = 0  # reintentos opcional
+MAX_DOCS = 3        # documentos usados para generar la respuesta
+
+# === CARGAR DATOS ===
+with open(DATA_FILE, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+textos = [f"{item.get('nombre', item.get('titulo',''))}: {item.get('descripcion','')}" for item in data]
+
+# === CONFIGURAR CHROMADB ===
+client = chromadb.Client()
+try:
+    collection = client.get_collection("empresa")
+except Exception:
+    collection = None
+
+ef = None
+try:
+    ef_candidate = embedding_functions.OllamaEmbeddingFunction(model_name="nomic-embed-text")
+    try:
+        _ = ef_candidate(["prueba"])
+        ef = ef_candidate
+    except Exception:
+        ef = None
+except Exception:
+    ef = None
+
+if ef is None:
+    try:
+        ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+    except Exception:
+        ef = None
+
+if collection is None:
+    if ef is not None:
+        collection = client.create_collection("empresa", embedding_function=ef)
+    else:
+        collection = client.create_collection("empresa")
+
+if collection.count() == 0:
+    ids = [str(i) for i in range(len(textos))]
+    collection.add(documents=textos, ids=ids)
+
+app = FastAPI(title="API de Empresa - respuestas basadas solo en empresa.json")
+
+def _normalize(s: str) -> str:
+    return (s or "").strip()
+
+def _is_related_query(query: str) -> bool:
+    q = (query or "").lower()
+    keywords = ["servici", "licencia", "certificado", "tramite", "autoriz", "construcción", "evento", "anuncio", "constancia", "numeración", "defensa civil", "arbitrios", "posesión"]
+    return any(k in q for k in keywords)
+
+def _build_paraphrase_from_item(item: dict, query: str) -> str:
+    nombre = _normalize(item.get("nombre") or item.get("titulo"))
+    descripcion = _normalize(item.get("descripcion"))
+    oficina = _normalize(item.get("oficina"))
+    duracion = _normalize(item.get("duracion"))
+    costo = _normalize(item.get("costo"))
+    requisitos = item.get("requisitos", [])
+    observaciones = _normalize(item.get("observaciones"))
+
+    qlow = (query or "").lower()
+    parts = []
+
+    # Priorizar requisitos si preguntan por ello
+    if "requisit" in qlow and requisitos:
+        if isinstance(requisitos, list):
+            sample = ", ".join(requisitos[:3])
+        else:
+            sample = str(requisitos)
+        return f"{nombre}: requisitos principales — {sample}."
+
+    # Si pregunta por "servicio(s)" devolver descripción resumida
+    if "servici" in qlow:
+        desc = descripcion.split(".")[0] if descripcion else nombre
+        out = f"{nombre}: {desc}."
+        meta = []
+        if oficina: meta.append(f"Se gestiona en {oficina}")
+        if duracion: meta.append(f"tiempo: {duracion}")
+        if costo: meta.append(f"costo: {costo}")
+        if meta:
+            out += " " + "; ".join(meta) + "."
+        return out
+
+    # Resumen general humano
+    if nombre and descripcion:
+        first_sent = re.split(r'[.!?]\s+', descripcion)[0]
+        parts.append(f"{nombre}: {first_sent}.")
+    elif descripcion:
+        parts.append(descripcion if descripcion.endswith(".") else descripcion + ".")
+    elif nombre:
+        parts.append(f"{nombre}.")
+
+    meta = []
+    if oficina: meta.append(f"Atendido en {oficina}")
+    if duracion: meta.append(f"Tiempo aproximado: {duracion}")
+    if costo: meta.append(f"Costo: {costo}")
+    if meta:
+        parts.append("; ".join(meta) + ".")
+
+    if observaciones:
+        parts.append(f"Nota: {observaciones}")
+
+    out = " ".join(parts).strip()
+    # limitar a 2 oraciones
+    sents = re.split(r'(?<=[.!?])\s+', out)
+    if len(sents) > 2:
+        out = " ".join(sents[:2]).strip()
+    return out
+
+def _query_collection(query: str, n_results: int = 5):
+    try:
+        return collection.query(query_texts=[query], n_results=n_results, include=["ids","documents"])
+    except Exception:
+        return {"ids": [[str(i) for i in range(len(data))]], "documents": [textos]}
+
+def _format_context_for_model(items: List[dict]) -> str:
+    parts = []
+    for it in items:
+        nombre = it.get("nombre") or it.get("titulo","")
+        descripcion = it.get("descripcion","").strip()
+        oficina = it.get("oficina","")
+        duracion = it.get("duracion","")
+        costo = it.get("costo","")
+        # pequeño bloque por item
+        block = f"- {nombre}. {descripcion}"
+        metas = []
+        if oficina: metas.append(f"Oficina: {oficina}")
+        if duracion: metas.append(f"Duración: {duracion}")
+        if costo: metas.append(f"Costo: {costo}")
+        if metas:
+            block += " (" + "; ".join(metas) + ")"
+        parts.append(block)
+    return "\n".join(parts)
+
+def _call_ollama(prompt: str) -> str:
+    payload = {"model": OLLAMA_MODEL, "prompt": prompt, "max_tokens": OLLAMA_MAX_TOKENS, "temperature": 0.0}
+    try:
+        r = requests.post("http://localhost:11434/api/generate", json=payload, timeout=OLLAMA_TIMEOUT)
+    except Exception:
+        return ""
+    # intentar json normal
+    try:
+        j = r.json()
+        # extracción sencilla
+        if isinstance(j, dict):
+            for k in ("response","text","generated","output","answer"):
+                if k in j and isinstance(j[k], str) and j[k].strip():
+                    return j[k].strip()
+            if "choices" in j and isinstance(j["choices"], list) and j["choices"]:
+                ch = j["choices"][0]
+                if isinstance(ch, dict):
+                    if "text" in ch and isinstance(ch["text"], str):
+                        return ch["text"].strip()
+                    if "content" in ch:
+                        c = ch["content"]
+                        if isinstance(c, str): return c.strip()
+                        if isinstance(c, list):
+                            parts = []
+                            for p in c:
+                                if isinstance(p, dict):
+                                    parts.append(p.get("text") or p.get("content") or "")
+                                elif isinstance(p, str):
+                                    parts.append(p)
+                            return "".join(parts).strip()
+    except Exception:
+        pass
+    # fallback: parsear texto por líneas JSON (streaming)
+    parts = []
+    text = r.text or ""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            idx = line.find("{")
+            if idx != -1:
+                try:
+                    obj = json.loads(line[idx:])
+                except Exception:
+                    continue
+            else:
+                continue
+        if isinstance(obj, dict):
+            if "response" in obj and isinstance(obj["response"], str):
+                parts.append(obj["response"])
+            elif "text" in obj and isinstance(obj["text"], str):
+                parts.append(obj["text"])
+            elif "generated" in obj and isinstance(obj["generated"], str):
+                parts.append(obj["generated"])
+            elif "choices" in obj and isinstance(obj["choices"], list):
+                for ch in obj["choices"]:
+                    if isinstance(ch, dict):
+                        if "text" in ch and isinstance(ch["text"], str):
+                            parts.append(ch["text"])
+                        if "content" in ch:
+                            c = ch["content"]
+                            if isinstance(c, str):
+                                parts.append(c)
+                            elif isinstance(c, list):
+                                for b in c:
+                                    if isinstance(b, dict):
+                                        parts.append(b.get("text","") or b.get("content",""))
+                                    elif isinstance(b, str):
+                                        parts.append(b)
+    return "".join(parts).strip()
+
+def _process_query_with_model(query: str):
+    # obtener top docs
+    res = _query_collection(query, n_results=MAX_DOCS)
+    ids = res.get("ids", [[]])[0] if res else []
+    if not ids:
+        return "No puedo hablar sobre eso."
+    items = []
+    for id_str in ids[:MAX_DOCS]:
+        try:
+            items.append(data[int(id_str)])
+        except Exception:
+            continue
+    context = _format_context_for_model(items)
+    if not context.strip():
+        return "No puedo hablar sobre eso."
+
+    prompt = (
+        "Eres un asistente que SOLO puede usar la información proporcionada abajo para RESPONDER y PARAFASEAR.\n"
+        "No agregues información, no hagas inferencias ni repitas texto literal salvo nombres y cifras.\n"
+        "Si la respuesta no está en la información, responde exactamente: \"No puedo hablar sobre eso.\"\n\n"
+        "Información (usa solo esto):\n"
+        f"{context}\n\n"
+        "Pregunta: " + query + "\n\n"
+        "Respuesta en español, clara y concisa (máx 2-3 oraciones):"
+    )
+
+    # llamar modelo
+    model_out = _call_ollama(prompt)
+    if model_out and not model_out.lower().startswith("error") and "no puedo hablar" not in model_out.lower():
+        # asegurar que no contiene información fuera del contexto: (no comprobamos exhaustivamente)
+        return model_out.strip()
+    # fallback local
+    paraphrases = []
+    for it in items:
+        p = _build_paraphrase_from_item(it, query)
+        if p:
+            paraphrases.append(p)
+    if not paraphrases:
+        return "No puedo hablar sobre eso."
+    # combinar en una sola frase humana
+    out = paraphrases[0]
+    if len(paraphrases) > 1:
+        extras = " ".join(paraphrases[1:MAX_DOCS])
+        out = f"{out} Además: {extras}"
+    out = re.sub(r'\s+', ' ', out).strip()
+    if not out.endswith("."):
+        out += "."
+    return out
+
+@app.post("/ask")
+def ask_post(body: dict = Body(...)):
+    query = (body.get("query") or "").strip()
+    if not query:
+        return {"respuesta": "Falta 'query' en el body."}
+    # si la consulta aparentemente no está relacionada, responder genérico
+    if not _is_related_query(query):
+        return {"respuesta": "No puedo hablar sobre eso."}
+    try:
+        texto = _process_query_with_model(query)
+        return {"respuesta": texto}
+    except Exception as e:
+        # fallback seguro: resumen local
+        import traceback
+        print(traceback.format_exc())
+        res_local = _process_query_with_model(query)
+        return {"respuesta": res_local}
+
+@app.get("/ask")
+def ask_get(query: str = Query(..., description="Pregunta sobre la empresa")):
+    return ask_post({"query": query})
+
+@app.get("/debug")
+def debug():
+    return {"document_count": collection.count(), "first_docs_preview": textos[:3]}

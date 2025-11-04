@@ -1,0 +1,155 @@
+[
+  {
+    "nombre": "Licencia de funcionamiento de establecimiento comercial",
+    "descripcion": "Procedimiento para autorizar el funcionamiento de locales comerciales, industriales o de servicios dentro del distrito.",
+    "requisitos": [
+      "Solicitud dirigida al alcalde",
+      "Copia simple del DNI o RUC del solicitante",
+      "Declaración jurada de cumplimiento de condiciones de seguridad",
+      "Plano de distribución interna del local",
+      "Recibo de pago del derecho de trámite"
+    ],
+    "oficina": "Gerencia de Desarrollo Económico Local",
+    "duracion": "7 días hábiles",
+    "costo": "S/ 120.00",
+    "fundamento_legal": "Ley N° 28976 – Ley Marco de Licencia de Funcionamiento",
+    "observaciones": "El trámite puede realizarse de manera presencial o virtual según el canal habilitado por la municipalidad."
+  },
+  {
+    "nombre": "Certificado de numeración municipal",
+    "descripcion": "Procedimiento para obtener la numeración o certificación del número de dirección de un predio urbano o rural.",
+    "requisitos": [
+      "Copia del DNI del propietario",
+      "Copia del título de propiedad o contrato de compra-venta",
+      "Plano de ubicación o croquis referencial",
+      "Pago del derecho de trámite"
+    ],
+    "oficina": "Subgerencia de Catastro",
+    "duracion": "5 días hábiles",
+    "costo": "S/ 45.00",
+    "fundamento_legal": "Ley Orgánica de Municipalidades N° 27972, Art. 79",
+    "observaciones": "Este documento es necesario para posteriores trámites de inscripción o licencias."
+  },
+  {
+    "nombre": "Licencia de construcción",
+    "descripcion": "Autorización otorgada por la municipalidad para ejecutar obras de edificación, ampliación o remodelación.",
+    "requisitos": [
+      "Solicitud firmada por el propietario o representante legal",
+      "Copia del DNI o RUC",
+      "Proyecto de obra aprobado por un profesional colegiado",
+      "Certificado de zonificación y compatibilidad de uso",
+      "Pago de los derechos municipales"
+    ],
+    "oficina": "Gerencia de Desarrollo Urbano",
+    "duracion": "10 días hábiles",
+    "costo": "S/ 180.00",
+    "fundamento_legal": "Ley N° 29090 – Ley de Regulación de Habilitaciones Urbanas y de Edificaciones",
+    "observaciones": "La licencia es requisito previo a la ejecución de obras y tiene una vigencia de 12 meses."
+  },
+  {
+    "nombre": "Constancia de posesión",
+    "descripcion": "Documento que acredita que una persona ocupa un terreno municipal de forma pacífica y continua.",
+    "requisitos": [
+      "Solicitud dirigida al alcalde",
+      "Copia del DNI",
+      "Declaración jurada de posesión",
+      "Recibo de pago por arbitrios municipales",
+      "Pago del derecho de trámite"
+    ],
+    "oficina": "Gerencia de Asentamientos Humanos",
+    "duracion": "15 días hábiles",
+    "costo": "S/ 60.00",
+    "fundamento_legal": "Ley Orgánica de Municipalidades N° 27972",
+    "observaciones": "La constancia no otorga derecho de propiedad, solo acredita ocupación de hecho."
+  },
+  {
+    "nombre": "Certificado de parámetros urbanísticos y edificatorios",
+    "descripcion": "Documento que indica las condiciones técnicas y normativas aplicables a un predio para la ejecución de proyectos de edificación.",
+    "requisitos": [
+      "Solicitud simple",
+      "Copia del título de propiedad",
+      "Plano de ubicación y localización",
+      "Pago del derecho de trámite"
+    ],
+    "oficina": "Subgerencia de Planeamiento Urbano y Catastro",
+    "duracion": "5 días hábiles",
+    "costo": "S/ 80.00",
+    "fundamento_legal": "Ley N° 29090 – Reglamento de Licencias de Edificación",
+    "observaciones": "El certificado tiene una vigencia de 3 años."
+  },
+  {
+    "nombre": "Autorización para anuncios publicitarios",
+    "descripcion": "Permite colocar paneles, letreros, carteles u otros medios de publicidad visual en espacios públicos o privados visibles desde la vía pública.",
+    "requisitos": [
+      "Solicitud dirigida al alcalde",
+      "Croquis o plano de ubicación del anuncio",
+      "Fotografía del lugar",
+      "Pago del derecho de trámite"
+    ],
+    "oficina": "Gerencia de Fiscalización y Control Municipal",
+    "duracion": "7 días hábiles",
+    "costo": "S/ 100.00",
+    "fundamento_legal": "Ordenanza Municipal N° 011-2022-MDJLO",
+    "observaciones": "Se prohíbe la instalación de anuncios que obstaculicen la visibilidad o afecten la seguridad vial."
+  },
+  {
+    "nombre": "Certificado de defensa civil – Inspección técnica de seguridad en edificaciones (ITSE)",
+    "descripcion": "Evalúa las condiciones de seguridad en los establecimientos comerciales, industriales y de servicios.",
+    "requisitos": [
+      "Solicitud firmada por el titular del establecimiento",
+      "Plano de distribución del local",
+      "Inventario de equipos y materiales inflamables",
+      "Pago del derecho de trámite"
+    ],
+    "oficina": "Subgerencia de Defensa Civil",
+    "duracion": "10 días hábiles",
+    "costo": "S/ 200.00",
+    "fundamento_legal": "Ley N° 28976 y D.S. N° 058-2014-PCM",
+    "observaciones": "El certificado tiene una vigencia de 2 años y debe renovarse antes de su vencimiento."
+  },
+  {
+    "nombre": "Constancia de no adeudo de arbitrios municipales",
+    "descripcion": "Documento que acredita que el contribuyente no tiene deudas pendientes con la municipalidad por concepto de arbitrios de limpieza, parques y serenazgo.",
+    "requisitos": [
+      "Copia del DNI del contribuyente",
+      "Número de cuenta o código de predio",
+      "Pago del derecho de trámite"
+    ],
+    "oficina": "Gerencia de Administración Tributaria",
+    "duracion": "2 días hábiles",
+    "costo": "S/ 25.00",
+    "fundamento_legal": "Ley de Tributación Municipal – D.S. N° 156-2004-EF",
+    "observaciones": "Es requisito para transferencias de propiedad y licencias."
+  },
+  {
+    "nombre": "Autorización para eventos públicos o espectáculos",
+    "descripcion": "Permite la realización de actividades culturales, recreativas o espectáculos en espacios públicos o privados abiertos al público.",
+    "requisitos": [
+      "Solicitud dirigida al alcalde",
+      "Plano del lugar del evento",
+      "Certificado de seguridad en defensa civil",
+      "Pago del derecho de trámite"
+    ],
+    "oficina": "Gerencia de Desarrollo Social y Cultural",
+    "duracion": "5 días hábiles",
+    "costo": "S/ 150.00",
+    "fundamento_legal": "Ley N° 26842 – Ley General de Salud, Ley N° 27972",
+    "observaciones": "Debe garantizarse el orden público y la limpieza posterior al evento."
+  },
+  {
+    "nombre": "Autorización para apertura de zanja o rotura de pavimento",
+    "descripcion": "Permite realizar obras que impliquen apertura de la vía pública o rotura de pavimento para la instalación o reparación de servicios básicos.",
+    "requisitos": [
+      "Solicitud dirigida al alcalde",
+      "Plano de la zona a intervenir",
+      "Cronograma de trabajo",
+      "Pago del derecho de trámite",
+      "Carta fianza de garantía"
+    ],
+    "oficina": "Gerencia de Infraestructura y Obras Públicas",
+    "duracion": "8 días hábiles",
+    "costo": "S/ 220.00",
+    "fundamento_legal": "Ordenanza Municipal N° 015-2021-MDJLO",
+    "observaciones": "El área intervenida debe ser repuesta a su estado original dentro del plazo aprobado."
+  }
+]
