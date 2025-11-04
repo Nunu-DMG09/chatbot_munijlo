@@ -5,6 +5,7 @@ import re
 import chromadb
 from chromadb.utils import embedding_functions
 from typing import List
+# === PRIMER COMMIT DE PETUSO ===
 
 # === CONFIGURACIÓN ===
 DATA_FILE = "empresa.json"
