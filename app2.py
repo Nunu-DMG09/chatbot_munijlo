@@ -16,6 +16,61 @@ OLLAMA_URL = "http://localhost:11434/api/generate"
 with open(DATA_FILE, "r", encoding="utf-8") as f:
     data = json.load(f)
 
+# === NORMALIZACIÓN Y PRECOMPUTE PARA RENDIMIENTO ===
+import time
+import hashlib
+
+def normalizar_texto(texto: str) -> str:
+    """Normaliza texto quitando tildes y convirtiendo a minúsculas"""
+    if not texto:
+        return ""
+    texto = unicodedata.normalize('NFKD', texto).encode('ascii', 'ignore').decode('ascii')
+    return re.sub(r'\s+', ' ', texto.lower().strip())
+
+# === PRECOMPUTE PARA RENDIMIENTO ===
+import time
+import hashlib
+
+# normalizar y precomputar títulos/tokens para búsquedas rápidas
+for item in data:
+    title = item.get("name") or item.get("title") or item.get("nombre") or ""
+    item["_norm_title"] = normalizar_texto(title)
+    text = " ".join([
+        str(item.get("name", "")),
+        str(item.get("title", "")),
+        str(item.get("nombre", "")),
+        str(item.get("description", "")),
+        str(item.get("requirements", "")),
+        str(item.get("queryInformation", "")),
+    ])
+    item["_tokens"] = set(re.findall(r'\w{3,}', normalizar_texto(text)))
+
+# cache simple en memoria para respuestas IA
+_ai_cache: Dict[str, Dict[str, Any]] = {}  # key -> {"resp": str, "ts": float}
+AI_CACHE_TTL = 300  # segundos
+
+# cache del JSON truncado (no recalcular cada petición)
+_raw_json_cache = None
+_raw_json_cache_ts = 0
+RAW_JSON_MAX_CHARS = 20000
+
+def contexto_json_truncado() -> str:
+    global _raw_json_cache, _raw_json_cache_ts
+    if _raw_json_cache and (time.time() - _raw_json_cache_ts) < AI_CACHE_TTL:
+        return _raw_json_cache
+    try:
+        raw = json.dumps(data, ensure_ascii=False)
+    except Exception:
+        raw = str(data)
+    if len(raw) > RAW_JSON_MAX_CHARS:
+        half = RAW_JSON_MAX_CHARS // 2
+        out = raw[:half] + "\n\n... (truncado) ...\n\n" + raw[-half:]
+    else:
+        out = raw
+    _raw_json_cache = out
+    _raw_json_cache_ts = time.time()
+    return out
+
 app = FastAPI(title="Chatbot Municipal JLO - IA Conversacional")
 
 # === GESTIÓN DE SESIONES ===
@@ -42,7 +97,7 @@ def _detalle_corto(item: Dict[str, Any]) -> str:
     requisitos = item.get("requirements") or item.get("requirements", "")
     tiempo = item.get("timeLimit") or item.get("timeLimit", "")
     pago = item.get("payment") or item.get("payment", "")
-    canales = item.get("channels") or item.get("channels", "") or item.get("location","")
+    canales = item.get("channels") or item.get("channels") or item.get("location","")
     parts = []
     if desc:
         parts.append(re.split(r'[.!?]\s+', desc)[0].strip())
@@ -71,9 +126,23 @@ def es_saludo(consulta: str) -> bool:
 
 def es_despedida(consulta: str) -> bool:
     """Detecta despedidas"""
-    despedidas = ["adios", "chau", "hasta luego", "nos vemos", "gracias", "bye"]
+    despedidas = ["adios", "hasta luego", "nos vemos", "gracias", "bye"]
     consulta_norm = normalizar_texto(consulta)
     return any(despedida in consulta_norm for despedida in despedidas)
+
+# Nuevo: detectar consultas fuera de alcance (seguridad) — debe estar definido antes de usarlo en /chat
+def es_fuera_de_alcance(consulta: str) -> bool:
+    """Detecta temas que no se deben responder (suicidio, violencia, armas, drogas, pornografía, etc.)."""
+    if not consulta:
+        return False
+    q = normalizar_texto(consulta)
+    patrones = [
+        r'\bsuicid', r'\bquitarme la vida', r'\bquitarse la vida', r'\bmatar(me|te|lo|la)\b',
+        r'\basesinar\b', r'\bbomba\b', r'\bexplos', r'\bcrear una bomba', r'\bveneno\b',
+        r'\bdroga(s)?\b', r'\bataque\b', r'\bhackear\b', r'\bporno\b', r'\bsexo explícito\b',
+        r'\bhacer daño\b', r'\bplanear un ataque\b'
+    ]
+    return any(re.search(p, q) for p in patrones)
 
 def extraer_palabras_clave(consulta: str) -> List[str]:
     """Extrae palabras clave relevantes de la consulta"""
@@ -85,187 +154,62 @@ def extraer_palabras_clave(consulta: str) -> List[str]:
     palabras = consulta_norm.split()
     return [p for p in palabras if len(p) > 2 and p not in stop_words]
 
-def buscar_tramites_inteligente(consulta: str) -> List[Dict[str, Any]]:
-    """Búsqueda inteligente que considera múltiples factores"""
-    palabras_clave = extraer_palabras_clave(consulta)
-    resultados_con_score = []
-    
-    for idx, item in enumerate(data):
-        score = 0
-        nombre = normalizar_texto(item.get("name", ""))
-        descripcion = normalizar_texto(item.get("description", ""))
-        requisitos = normalizar_texto(str(item.get("requirements", "")))
-        
-        texto_completo = f"{nombre} {descripcion} {requisitos}"
-        
-        # Puntuación por coincidencias exactas en nombre (mayor peso)
-        for palabra in palabras_clave:
-            if palabra in nombre:
-                score += 10
-            elif palabra in descripcion:
-                score += 5
-            elif palabra in requisitos:
-                score += 2
-        
-        # Puntuación por coincidencias parciales
-        for palabra in palabras_clave:
-            if any(palabra in palabra_texto for palabra_texto in texto_completo.split()):
-                score += 1
-        
-        if score > 0:
-            resultados_con_score.append({
-                "item": item,
-                "score": score,
-                "index": idx
-            })
-    
-    # Ordenar por score descendente y tomar los mejores
-    resultados_con_score.sort(key=lambda x: x["score"], reverse=True)
-    return [r["item"] for r in resultados_con_score[:3]]
-
-def generar_respuesta_con_ia(tramites: List[Dict], consulta: str, historial: List[Dict] = None) -> str:
-    """Genera respuesta usando tinyllama con contexto conversacional"""
-    if not tramites:
-        return "No encontré información específica sobre tu consulta. ¿Podrías ser más específico sobre qué trámite o servicio municipal necesitas?"
-    
-    # Construir contexto de trámites
-    contexto_tramites = ""
-    for i, tramite in enumerate(tramites[:3], 1):
-        nombre = tramite.get("name", "Trámite")
-        descripcion = tramite.get("description", "")
-        requisitos = tramite.get("requirements", "")
-        costo = tramite.get("payment", "")
-        tiempo = tramite.get("timeLimit", "")
-        
-        contexto_tramites += f"\n{i}. {nombre}:\n"
-        if descripcion:
-            contexto_tramites += f"   Descripción: {descripcion[:200]}...\n"
-        if requisitos:
-            contexto_tramites += f"   Requisitos: {requisitos[:150]}...\n"
-        if costo:
-            contexto_tramites += f"   Costo: {costo}\n"
-        if tiempo:
-            contexto_tramites += f"   Tiempo: {tiempo}\n"
-    
-    # Construir historial conversacional
-    contexto_historial = ""
-    if historial:
-        contexto_historial = "\nHistorial de conversación:\n"
-        for msg in historial[-4:]:  # Últimos 4 mensajes
-            rol = "Usuario" if msg["role"] == "user" else "Asistente"
-            contexto_historial += f"{rol}: {msg['content'][:100]}...\n"
-    
-    # Prompt para tinyllama
-    prompt = f"""Eres un asistente virtual de la Municipalidad de José Leonardo Ortiz. Responde de manera amigable y profesional.
-
-INFORMACIÓN DISPONIBLE:{contexto_tramites}
-
-{contexto_historial}
-
-CONSULTA ACTUAL: {consulta}
-
-INSTRUCCIONES:
-- Responde en español de manera conversacional y amigable
-- Usa SOLO la información proporcionada
-- Si preguntan por requisitos, tiempo o costo, sé específico
-- Si la consulta no está clara, pide aclaración
-- Mantén un tono profesional pero cercano
-- No inventes información que no esté en los datos
-
-RESPUESTA:"""
-
-    try:
-        # Llamada a tinyllama
-        payload = {
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": 0.7,
-                "max_tokens": 200,
-                "top_p": 0.9
-            }
-        }
-        
-        response = requests.post(OLLAMA_URL, json=payload, timeout=30)
-        response.raise_for_status()
-        
-        result = response.json()
-        respuesta_ia = result.get("response", "").strip()
-        
-        if respuesta_ia and len(respuesta_ia) > 10:
-            return respuesta_ia
-        else:
-            # Fallback si la IA no responde bien
-            return generar_respuesta_fallback(tramites[0], consulta)
-            
-    except Exception as e:
-        print(f"Error con Ollama: {e}")
-        return generar_respuesta_fallback(tramites[0], consulta)
-
-def generar_respuesta_fallback(tramite: Dict, consulta: str) -> str:
-    """Respuesta de fallback cuando la IA no está disponible"""
-    nombre = tramite.get("name", "")
-    descripcion = tramite.get("description", "")[:150]
-    costo = tramite.get("payment", "")
-    tiempo = tramite.get("timeLimit", "")
-    
-    respuesta = f"Te ayudo con información sobre {nombre}. "
-    
-    if descripcion:
-        respuesta += f"{descripcion}. "
-    
-    detalles = []
-    if costo and costo != "Gratuito":
-        detalles.append(f"Costo: {costo}")
-    elif costo == "Gratuito":
-        detalles.append("Es gratuito")
-    
-    if tiempo:
-        detalles.append(f"Tiempo: {tiempo}")
-    
-    if detalles:
-        respuesta += f"({', '.join(detalles)}). "
-    
-    respuesta += "¿Necesitas información específica sobre requisitos o algún otro detalle?"
-    
-    return respuesta
-
 def buscar_por_titulo_exacto(mensaje: str) -> List[Dict[str, Any]]:
-    """Busca coincidencia exacta o muy cercana en campos name/title/nombre."""
+    """Coincidencia fuerte en título (igualdad o el título está contenido en la consulta)."""
     nq = normalizar_texto(mensaje)
-    candidatos: List[Dict[str, Any]] = []
-    for item in data:
-        title = _titulo_corto(item)
-        if not title:
-            continue
-        nn = normalizar_texto(title)
-        if nn == nq or f" {nn} " in f" {nq} " or nq in nn or nn in nq:
-            candidatos.append(item)
-    return candidatos
-
-def buscar_por_titulo_parcial(mensaje: str) -> List[Dict[str, Any]]:
-    """Busca títulos que parcialmente coincidan (tokens o prefijos)."""
-    tokens = [t for t in re.findall(r'\w{4,}', normalizar_texto(mensaje))]
     resultados: List[Dict[str, Any]] = []
-    if not tokens:
-        return resultados
     for item in data:
         title = _titulo_corto(item)
         if not title:
             continue
         nn = normalizar_texto(title)
-        if any(tok in nn for tok in tokens) or any(nn.startswith(tok) for tok in tokens):
+        # igualdad exacta o el título aparece como frase en la consulta o la consulta en el título
+        if nn == nq or nn in nq or nq in nn:
             resultados.append(item)
     return resultados
 
-@app.get("/")
-def inicio():
-    return {
-        "mensaje": "¡Hola! Soy Leonardito, el asistente virtual de la Municipalidad de José Leonardo Ortiz.",
-        "uso": "Usa POST /chat con {'mensaje': 'tu consulta', 'session_id': 'opcional'}"
-    }
+def buscar_por_titulo_parcial(mensaje: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """Coincidencia parcial por tokens en título. Devuelve lista corta (limit)."""
+    tokens = [t for t in re.findall(r'\w{3,}', normalizar_texto(mensaje))]
+    if not tokens:
+        return []
+    resultados: List[Dict[str, Any]] = []
+    for item in data:
+        title = _titulo_corto(item)
+        if not title:
+            continue
+        nn = normalizar_texto(title)
+        # si cualquier token aparece en el título (contención) o título comienza por token
+        if any(tok in nn for tok in tokens) or any(nn.startswith(tok) for tok in tokens):
+            resultados.append(item)
+            if len(resultados) >= limit:
+                break
+    return resultados
 
+def buscar_tramites_inteligente(consulta: str, k: int = 5) -> List[Dict[str, Any]]:
+    """Búsqueda rápida usando tokens precomputados.
+    Requiere un mínimo de solapamiento para considerar relevante (mejora precisión)."""
+    qtokens = set(re.findall(r'\w{3,}', normalizar_texto(consulta)))
+    if not qtokens:
+        return []
+    # umbral mínimo: si la consulta tiene 1 token, requisito 1; si >=2 tokens, requisito 2
+    min_overlap = 1 if len(qtokens) <= 1 else 2
+    scored = []
+    for item in data:
+        overlap = len(qtokens & item.get("_tokens", set()))
+        if overlap >= min_overlap:
+            scored.append((overlap, item))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [it for sc, it in scored[:k]]
+
+def _lista_titulos(items: List[Dict[str, Any]], limit: int = 10) -> str:
+    """Retorna lista corta de títulos legibles separada por líneas."""
+    lines = []
+    for it in items[:limit]:
+        lines.append(_titulo_corto(it))
+    return "\n".join(lines)
+
+# Reemplaza el endpoint /chat por la lógica solicitada:
 @app.post("/chat")
 def chat(body: dict = Body(...)):
     mensaje = (body.get("mensaje") or "").strip()
@@ -274,48 +218,66 @@ def chat(body: dict = Body(...)):
     if not mensaje:
         return {"respuesta": "Escribe tu consulta, por favor.", "session_id": session_id}
 
-    # saludos/despedidas rápidos
+    # bloqueo estricto para temas fuera de alcance
+    if es_fuera_de_alcance(mensaje):
+        return {"respuesta": "No puedo hablar sobre eso.", "session_id": session_id, "candidatos": 0}
+
+    # saludos y despedidas manejadas de forma segura (no ambigüedad)
     if es_saludo(mensaje):
         return {"respuesta": "Hola, soy Leonardito, el asistente virtual. ¿En qué trámite te puedo ayudar?", "session_id": session_id}
     if es_despedida(mensaje):
-        return {"respuesta": "Gracias. Si necesitas más ayuda, escríbeme.", "session_id": session_id}
+        return {"respuesta": "Si necesitas algo más sobre trámites municipales, dímelo.", "session_id": session_id}
 
-    # 1) Prioridad: coincidencia exacta en título -> devolver detalle directo (si único)
-    exact = buscar_por_titulo_exacto(mensaje)
-    if len(exact) == 1:
-        detalle = _detalle_corto(exact[0])
-        return {"respuesta": detalle, "session_id": session_id, "candidatos": 1}
+    # 1) coincidencia exacta en título
+    exactos = buscar_por_titulo_exacto(mensaje)
+    if len(exactos) == 1:
+        # item único -> pedir a la IA que RESUMA usando SOLO ese ítem + JSON truncado
+        item = exactos[0]
+        contexto = _detalle_corto(item)
+        ai_out = generar_respuesta_ia(contexto, mensaje)
+        if ai_out:
+            return {"respuesta": ai_out.strip(), "session_id": session_id, "candidatos": 1}
+        return {"respuesta": contexto, "session_id": session_id, "candidatos": 1}
 
-    if len(exact) > 1:
-        # si hay varias coincidencias exactas, listar títulos y pedir especificar
-        lista = [ _titulo_corto(it) for it in exact ]
-        texto = "Encontré varios procesos que coinciden exactamente:\n\n" + "\n".join(lista) + "\n\nPor favor indica cuál deseas consultar."
-        return {"respuesta": texto, "session_id": session_id, "candidatos": len(lista)}
+    if len(exactos) > 1:
+        # varios exactos -> listar títulos y pedir especificar
+        lista = _lista_titulos(exactos)
+        texto = f"Encontré varios procesos que coinciden exactamente:\n\n{lista}\n\nPor favor indica cuál deseas consultar."
+        return {"respuesta": texto, "session_id": session_id, "candidatos": len(exactos)}
 
-    # 2) Búsqueda parcial por título -> si varios, listar y pedir especificación
-    parc = buscar_por_titulo_parcial(mensaje)
-    if len(parc) == 1:
-        detalle = _detalle_corto(parc[0])
-        return {"respuesta": detalle, "session_id": session_id, "candidatos": 1}
-    if len(parc) > 1:
-        lista = [ _titulo_corto(it) for it in parc ]
-        texto = f"Encontré varios procesos relacionados con tu consulta:\n\n" + "\n".join(lista) + "\n\nPor favor indica cuál deseas consultar."
-        return {"respuesta": texto, "session_id": session_id, "candidatos": len(lista)}
+    # 2) coincidencias parciales por título
+    parciales = buscar_por_titulo_parcial(mensaje, limit=10)
+    if len(parciales) == 1:
+        item = parciales[0]
+        contexto = _detalle_corto(item)
+        ai_out = generar_respuesta_ia(contexto, mensaje)
+        if ai_out:
+            return {"respuesta": ai_out.strip(), "session_id": session_id, "candidatos": 1}
+        return {"respuesta": contexto, "session_id": session_id, "candidatos": 1}
 
-    # 3) Si no hay matches en títulos, intentar búsqueda inteligente (nombre/descripcion/requisitos)
-    tramites_encontrados = buscar_tramites_inteligente(mensaje)
-    if not tramites_encontrados:
-        return {"respuesta": "No puedo hablar sobre eso.", "session_id": session_id, "candidatos": 0}
+    if len(parciales) > 1:
+        lista = _lista_titulos(parciales, limit=10)
+        texto = f"Encontré varios procesos relacionados con tu consulta:\n\n{lista}\n\nPor favor indica cuál deseas consultar."
+        return {"respuesta": texto, "session_id": session_id, "candidatos": len(parciales)}
 
-    # si la búsqueda inteligente devuelve un solo trámite relevante, mostrar detalle breve
-    if len(tramites_encontrados) == 1:
-        detalle = _detalle_corto(tramites_encontrados[0])
-        return {"respuesta": detalle, "session_id": session_id, "candidatos": 1}
+    # 3) búsqueda por solapamiento en campos (inteligente)
+    tramites = buscar_tramites_inteligente(mensaje, k=5)
+    if not tramites:
+        # sin coincidencias relevantes -> no responder fuera de contexto
+        return {"respuesta": "No puedo hablar sobre eso. Puedo ayudar solo con trámites y servicios municipales listados.", "session_id": session_id, "candidatos": 0}
 
-    # si hay varios resultados de búsqueda inteligente, listar títulos y pedir especificar
-    lista = [ _titulo_corto(it) for it in tramites_encontrados ]
-    texto = "Encontré varios trámites que pueden coincidir:\n\n" + "\n".join(lista) + "\n\nPor favor indica cuál deseas consultar."
-    return {"respuesta": texto, "session_id": session_id, "candidatos": len(lista)}
+    if len(tramites) == 1:
+        item = tramites[0]
+        contexto = _detalle_corto(item)
+        ai_out = generar_respuesta_ia(contexto, mensaje)
+        if ai_out:
+            return {"respuesta": ai_out.strip(), "session_id": session_id, "candidatos": 1}
+        return {"respuesta": contexto, "session_id": session_id, "candidatos": 1}
+
+    # varios resultados relevantes -> listar y pedir especificación
+    lista = _lista_titulos(tramites, limit=10)
+    texto = f"Encontré varios trámites que pueden coincidir:\n\n{lista}\n\nPor favor indica cuál deseas consultar."
+    return {"respuesta": texto, "session_id": session_id, "candidatos": len(tramites)}
 
 @app.post("/reset_session")
 def reset_session(body: dict = Body(...)):
@@ -333,6 +295,137 @@ def debug_sessions():
         "sesiones_activas": len(sessions),
         "total_tramites": len(data)
     }
+
+def _call_ollama(prompt: str) -> str:
+    """Llamada a Ollama con cache y ensamblado NDJSON. Menor max_tokens y timeout para velocidad."""
+    # cache por hash de prompt
+    key = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    entry = _ai_cache.get(key)
+    if entry and (time.time() - entry["ts"]) < AI_CACHE_TTL:
+        return entry["resp"]
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        # reducir max_tokens para respuestas breves y menor latencia
+        "max_tokens": 140,
+        "temperature": 0.2,
+        "stream": False
+    }
+    try:
+        r = requests.post(OLLAMA_URL, json=payload, timeout=25)
+        r.raise_for_status()
+    except Exception:
+        return ""
+
+    # intentar parsear JSON completo primero
+    try:
+        j = r.json()
+        # casos simples
+        if isinstance(j, dict):
+            for k in ("response", "text", "generated", "output", "answer"):
+                v = j.get(k)
+                if isinstance(v, str) and v.strip():
+                    out = v.strip()
+                    _ai_cache[key] = {"resp": out, "ts": time.time()}
+                    return out
+            if "choices" in j and isinstance(j["choices"], list) and j["choices"]:
+                ch = j["choices"][0]
+                if isinstance(ch, dict):
+                    if isinstance(ch.get("text"), str) and ch["text"].strip():
+                        out = ch["text"].strip()
+                        _ai_cache[key] = {"resp": out, "ts": time.time()}
+                        return out
+        if isinstance(j, list):
+            parts = []
+            for obj in j:
+                if isinstance(obj, dict):
+                    parts.append(obj.get("response") or obj.get("text") or "")
+                elif isinstance(obj, str):
+                    parts.append(obj)
+            out = "".join(p for p in parts if p).strip()
+            if out:
+                _ai_cache[key] = {"resp": out, "ts": time.time()}
+                return out
+    except ValueError:
+        pass
+
+    # fallback a NDJSON/stream parsing de texto
+    text = r.text or ""
+    parts = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            parts.append(line)
+            continue
+        v = None
+        for k in ("response", "text", "generated", "output", "answer"):
+            if k in obj:
+                if isinstance(obj[k], str):
+                    v = obj[k]
+                    break
+                if isinstance(obj[k], list):
+                    v = "".join([p if isinstance(p, str) else str(p) for p in obj[k]])
+                    break
+                if isinstance(obj[k], dict):
+                    v = obj[k].get("text") or obj[k].get("content") or None
+                    if v:
+                        break
+        if v:
+            parts.append(v)
+    out = "".join(parts).strip()
+    if out:
+        _ai_cache[key] = {"resp": out, "ts": time.time()}
+    return out
+
+def generar_respuesta_ia(item_contexto: str, pregunta: str) -> str:
+    """Construye prompt que obliga a Leonardito a PARALEFRASEAR/RESUMIR usando SOLO la info
+    y realiza una limpieza si el modelo devuelve JSON crudo."""
+    # contexto JSON truncado (ya definido)
+    json_ctx = contexto_json_truncado()
+
+    prompt = (
+        "Eres Leonardito, asistente virtual de la Municipalidad de José Leonardo Ortiz.\n"
+        "INSTRUCCIONES (MUY IMPORTANTES):\n"
+        "- Usa SOLO la información provista en 'ITEM' y en 'JSON_COMPLETO'.\n"
+        "- No repitas ni pegues fragmentos literales del JSON. Parafrasea y resume la información en español natural.\n"
+        "- Si el usuario pide un campo concreto (requisitos, tiempo, costo, contacto), responde solo con ese dato.\n"
+        "- Si la consulta no puede responderse con la información provista, responde EXACTAMENTE: \"No puedo hablar sobre eso.\"\n"
+        "- Responde breve (1-2 frases) en primera persona cuando corresponda.\n\n"
+        "ITEM:\n" + item_contexto + "\n\n"
+        "JSON_COMPLETO:\n" + json_ctx + "\n\n"
+        "PREGUNTA: " + pregunta + "\n\n"
+        "RESPUESTA:"
+    )
+
+    # Llamada inicial
+    out = _call_ollama(prompt)
+    if not out:
+        return ""
+
+    # Si la salida contiene JSON/NDJSON/crudo o muchos caracteres de JSON, pedir reescritura breve
+    if (("{" in out and "}" in out) or '"' in out or 'queryInformation' in out or 'requirements' in out or re.search(r'\{.*\}', out)):
+        clean_prompt = (
+            "Reescribe el siguiente texto en español natural y MUY BREVE (1 frase), "
+            "parafraseando y sin incluir ningún fragmento JSON ni nombres de campos:\n\n"
+            + out + "\n\nRespuesta breve:"
+        )
+        out2 = _call_ollama(clean_prompt)
+        if out2:
+            return out2.strip()
+        # si no hay respuesta limpia, intentar una extracción simple: tomar la primera oración
+    # tomar primera oración completa para mayor concisión
+    s = re.split(r'[.!?]\s+', out.strip())
+    if s:
+        first = s[0].strip()
+        if first and not first.endswith("."):
+            first += "."
+        return first
+    return out.strip()
 
 if __name__ == "__main__":
     import uvicorn
