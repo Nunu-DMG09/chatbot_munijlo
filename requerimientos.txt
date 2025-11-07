@@ -3,4 +3,8 @@ pip install fastapi uvicorn chromadb requests
 llama3.2:1b
 
 uvicorn app:app --reload
+python -m venv .venv
+ pip install sentence-transformers
+
+uvicorn app:app --reload --host 127.0.0.1 --port 8000
 curl "http://127.0.0.1:8000/ask?query=¿Qué servicios ofrecen?"
