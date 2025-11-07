@@ -5,10 +5,15 @@ import re
 import chromadb
 from chromadb.utils import embedding_functions
 from typing import List
+import os
 # === PRIMER COMMIT DE PETUSO ===
 
 # === CONFIGURACIÓN ===
-DATA_FILE = "empresa.json"
+# preferir dataset TUPA si existe; si no, usar empresa.json
+DATA_FILE_PRI = "tupa_data.json"
+DATA_FILE_SEC = "empresa.json"
+DATA_FILE = DATA_FILE_PRI if os.path.exists(DATA_FILE_PRI) else DATA_FILE_SEC
+
 OLLAMA_MODEL = "tinyllama:latest"
 OLLAMA_MAX_TOKENS = 120     # reducir para respuestas más rápidas
 OLLAMA_TIMEOUT = 20        # timeout menor para mayor responsividad
@@ -19,7 +24,14 @@ MAX_DOCS = 3               # documentos usados para generar la respuesta
 with open(DATA_FILE, "r", encoding="utf-8") as f:
     data = json.load(f)
 
-textos = [f"{item.get('nombre', item.get('titulo',''))}: {item.get('descripcion','')}" for item in data]
+# soportar archivos con campos 'name'/'description' (TUPA) o 'nombre'/'descripcion' (empresa.json)
+def _get_title(item: dict) -> str:
+    return (item.get("name") or item.get("nombre") or item.get("titulo") or "").strip()
+
+def _get_description(item: dict) -> str:
+    return (item.get("description") or item.get("descripcion") or item.get("descripcion_corta") or "").strip()
+
+textos = [f"{_get_title(item)}: {_get_description(item)}" for item in data]
 
 # === CONFIGURAR CHROMADB ===
 client = chromadb.Client()
@@ -71,45 +83,60 @@ def _is_greeting(query: str) -> bool:
     return bool(re.search(r'^\s*(hola|hey|buenas|buenos días|buenas tardes|buenas noches)\b', query, re.I))
 
 def _build_paraphrase_from_item(item: dict, query: str) -> str:
-    nombre = _normalize(item.get("nombre") or item.get("titulo"))
-    descripcion = _normalize(item.get("descripcion"))
-    oficina = _normalize(item.get("oficina"))
-    duracion = _normalize(item.get("duracion"))
-    costo = _normalize(item.get("costo"))
-    requisitos = item.get("requisitos", [])
-    observaciones = _normalize(item.get("observaciones"))
+    # título y descripción neutros
+    title = _get_title(item)
+    desc = _get_description(item)
+
+    # mapear campos alternativos
+    requisitos = item.get("requisitos") or item.get("requirements") or []
+    duracion = item.get("duracion") or item.get("timeLimit") or ""
+    costo = item.get("costo") or item.get("payment") or ""
+    oficina = item.get("oficina") or item.get("submissionEntity") or item.get("approvalEntity") or ""
+    observaciones = item.get("observaciones") or item.get("calification") or ""
+    fundamento = item.get("fundamento_legal") or ""
 
     qlow = (query or "").lower()
+
+    # detectar intención de campo simple
+    if any(k in qlow for k in ("requisit","document","qué necesito","qué se necesita","requirements")):
+        if requisitos:
+            if isinstance(requisitos, list):
+                sample = ", ".join(requisitos[:5])
+            else:
+                sample = str(requisitos).replace("\n", " ")
+            return f"{title}: requisitos principales — {sample}."
+        return f"{title}: no hay requisitos especificados."
+
+    if any(k in qlow for k in ("duraci","tiempo","plazo","days","timeLimit")):
+        return f"{title}: tiempo aproximado — {duracion}." if duracion else f"{title}: tiempo no especificado."
+
+    if any(k in qlow for k in ("cost","costo","precio","tarifa","cuánto cuesta","cuanto cuesta","monto")):
+        return f"{title}: costo — {costo}." if costo else f"{title}: costo no especificado."
+
+    if any(k in qlow for k in ("oficina","sede","donde","dónde","submission","approval","aprobación")):
+        return f"{title}: se gestiona en {oficina}." if oficina else f"{title}: oficina no especificada."
+
+    if any(k in qlow for k in ("fundament","ley","ordenanza","legal","norma")):
+        return f"{title}: fundamento legal — {fundamento}." if fundamento else f"{title}: fundamento legal no especificado."
+
+    if any(k in qlow for k in ("observ","nota","comentario","detalle","calification")):
+        return f"{title}: {observaciones}." if observaciones else f"{title}: sin observaciones."
+
+    if any(k in qlow for k in ("descr","qué es","en qué consiste","para qué sirve","description")):
+        if desc:
+            snippet = re.split(r'[.!?]\s+', desc)[0]
+            return f"{title}: {snippet}."
+        return f"{title}: sin descripción."
+
+    # fallback: resumen breve con meta
     parts = []
-
-    # Priorizar requisitos si preguntan por ello
-    if "requisit" in qlow and requisitos:
-        if isinstance(requisitos, list):
-            sample = ", ".join(requisitos[:3])
-        else:
-            sample = str(requisitos)
-        return f"{nombre}: requisitos principales — {sample}."
-
-    # Si pregunta por "servicio(s)" devolver descripción resumida
-    if "servici" in qlow:
-        desc = descripcion.split(".")[0] if descripcion else nombre
-        out = f"{nombre}: {desc}."
-        meta = []
-        if oficina: meta.append(f"Se gestiona en {oficina}")
-        if duracion: meta.append(f"tiempo: {duracion}")
-        if costo: meta.append(f"costo: {costo}")
-        if meta:
-            out += " " + "; ".join(meta) + "."
-        return out
-
-    # Resumen general humano
-    if nombre and descripcion:
-        first_sent = re.split(r'[.!?]\s+', descripcion)[0]
-        parts.append(f"{nombre}: {first_sent}.")
-    elif descripcion:
-        parts.append(descripcion if descripcion.endswith(".") else descripcion + ".")
-    elif nombre:
-        parts.append(f"{nombre}.")
+    if title and desc:
+        first_sent = re.split(r'[.!?]\s+', desc)[0]
+        parts.append(f"{title}: {first_sent}.")
+    elif desc:
+        parts.append(desc if desc.endswith(".") else desc + ".")
+    elif title:
+        parts.append(f"{title}.")
 
     meta = []
     if oficina: meta.append(f"Atendido en {oficina}")
@@ -117,12 +144,9 @@ def _build_paraphrase_from_item(item: dict, query: str) -> str:
     if costo: meta.append(f"Costo: {costo}")
     if meta:
         parts.append("; ".join(meta) + ".")
-
     if observaciones:
         parts.append(f"Nota: {observaciones}")
-
     out = " ".join(parts).strip()
-    # limitar a 2 oraciones
     sents = re.split(r'(?<=[.!?])\s+', out)
     if len(sents) > 2:
         out = " ".join(sents[:2]).strip()
@@ -137,16 +161,20 @@ def _query_collection(query: str, n_results: int = 5):
 def _format_context_for_model(items: List[dict]) -> str:
     parts = []
     for it in items:
-        nombre = it.get("nombre") or it.get("titulo","")
-        descripcion = it.get("descripcion","").strip()
-        oficina = it.get("oficina","")
-        duracion = it.get("duracion","")
-        costo = it.get("costo","")
-        # pequeño bloque por item
-        block = f"- {nombre}. {descripcion}"
+        # soportar ambos esquemas: TUPA (name/description/requirements/timeLimit/payment/channels/form/code)
+        # y empresa.json (nombre/descripcion/requisitos/duracion/costo/oficina)
+        title = _get_title(it) or ""
+        desc = _get_description(it) or ""
+        # campos alternativos
+        requisitos = it.get("requisitos") or it.get("requirements") or None
+        tiempo = it.get("duracion") or it.get("timeLimit") or ""
+        costo = it.get("costo") or it.get("payment") or ""
+        oficina = it.get("oficina") or it.get("submissionEntity") or it.get("approvalEntity") or ""
+
+        block = f"- {title}. {desc}".strip()
         metas = []
         if oficina: metas.append(f"Oficina: {oficina}")
-        if duracion: metas.append(f"Duración: {duracion}")
+        if tiempo: metas.append(f"Duración: {tiempo}")
         if costo: metas.append(f"Costo: {costo}")
         if metas:
             block += " (" + "; ".join(metas) + ")"
@@ -247,15 +275,14 @@ def _process_query_with_model(query: str):
 
     nq = _norm_txt(q)
 
-    # 1) Buscar coincidencia exacta / contiene en 'nombre' en todo el JSON
+    # 1) Buscar coincidencia exacta / contiene en 'titulo' (soporta TUPA 'name' y empresa 'nombre')
     exact_candidates = []
     best_len = 0
     for idx, item in enumerate(data):
-        nombre = item.get("nombre") or item.get("titulo") or ""
-        nn = _norm_txt(nombre)
+        title_raw = _get_title(item) or ""
+        nn = _norm_txt(title_raw)
         if not nn:
             continue
-        # condiciones de coincidencia: igualdad, nombre dentro de la consulta, o consulta dentro del nombre
         if nn == nq or f" {nn} " in f" {nq} " or nq in nn or nn in nq:
             ln = len(nn)
             if ln > best_len:
@@ -265,10 +292,8 @@ def _process_query_with_model(query: str):
                 exact_candidates.append((idx, item))
 
     if exact_candidates:
-        # usar el candidato con nombre más largo (mejor especificidad)
         chosen = exact_candidates[0][1]
         resp = _build_paraphrase_from_item(chosen, query)
-        # asegurar formato breve y en español
         resp = resp.strip()
         if not resp.endswith("."):
             resp += "."
